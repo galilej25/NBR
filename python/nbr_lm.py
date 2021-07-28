@@ -1,63 +1,78 @@
-import csv
 import time
 import signal
 import numpy as np
 import pandas as pd
 import scipy.stats
 import multiprocessing as mp
-import statsmodels.formula.api as smf
+from sklearn import linear_model
 
 
 def init_worker():
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
-def fit_linear_model(data, dependent, formula):
+def fit_linear_model(X, y):
     """
 
-    :param data:
-    :param dependent:
-    :param formula:
+    :param X:  input variables
+    :param y:  dependent variables
     :return:
     """
-    # create a linear model
-    # FIXME: we need to figure out a better way to parse formula
-    lm = smf.ols(
-        formula='%s ~ %s' % (dependent, formula),
-        data=data
+
+    # Step 1: train model
+    lr_model = linear_model.LinearRegression().fit(
+        X,
+        y
     )
-    res = lm.fit()
+    # Step 2: prediction
+    predictions = lr_model.predict(X)
 
-    # return t-values and p-values for each independent variable
-    res_out = pd.concat([res.tvalues, res.pvalues], axis=1).iloc[1:]
-    res_out.columns = ['tvals_%s' % dependent, 'pvals_%s' % dependent]
-    return res_out
+    # Step 3: pval and tval calculation
+
+    # 3a: get coefficients and stack them with intercept
+    lr_parameters = np.vstack((lr_model.intercept_.T, lr_model.coef_.T)).T
+
+    # 3b: append 1s to input data (for intercept)
+    X_intercept = np.append(np.ones((len(X), 1)), X, axis=1)
+    # 3b: get mean squared error between true values and predictions and scale it
+    mse = np.sum((y - predictions) ** 2, axis=0) / (X_intercept.shape[0] - X_intercept.shape[1])
+
+    # 3c: calculate invariant of input dataset (this might be tricky to do for larger matrix)
+    X_inv = np.linalg.inv(np.dot(X_intercept.T, X_intercept)).diagonal()
+
+    # 3d: estimate variance and standard deviation to calculate tvals
+    var = np.dot(mse.values.reshape(mse.shape[0], 1), X_inv.reshape(1, X_inv.shape[0]))
+    std = np.sqrt(var)
+    tvals = lr_parameters / std
+
+    # 3e: calculate pvalues
+    pvals = [2 * (1 - scipy.stats.t.cdf(np.abs(i), (X_intercept.shape[0] - X_intercept.shape[1]))) for i in tvals]
+
+    # 3f: save it in dataframe
+    columns = ['Intercept'] + X.columns.tolist()
+    index = ['tvals_%s' % c for c in y.columns] + ['pvals_%s' % c for c in y.columns]
+    df_result = pd.DataFrame(
+        np.vstack((tvals, pvals)),
+        columns=columns,
+        index=index,
+    ).T.iloc[1:]
+
+    return df_result
 
 
-def get_observations(data, mod, thr_t, thr_p, alternative, ci):
+def get_observations(X, y, thr_t, thr_p, alternative, ci):
     """
 
     :return:
     """
-    st = time.time()
-    lms = []
-    for column in data.columns[3:]:
-        lms.append(
-            fit_linear_model(
-                data,
-                column,
-                mod
-            )
-        )
-    lms = pd.concat(lms, axis=1)
-    et = time.time()
-    print('Linear Models Estimation finished in %.5f [s]' % (et-st))
 
-    st = time.time()
+    # Get linear models
+    lms = fit_linear_model(X, y)
+
     df_tvals = lms[[col for col in lms.columns if 'tvals_' in col]]
     df_pvals = lms[[col for col in lms.columns if 'pvals_' in col]]
-    qt_2 = scipy.stats.t.ppf(1 - thr_p / 2, data.shape[0] - lms.shape[0] - 1)
-    qt = scipy.stats.t.ppf(1 - thr_p, data.shape[0] - lms.shape[0] - 1)
+    qt_2 = scipy.stats.t.ppf(1 - thr_p / 2, X.shape[0] - lms.shape[0] - 1)
+    qt = scipy.stats.t.ppf(1 - thr_p, X.shape[0] - lms.shape[0] - 1)
 
     if thr_t is not None:
         # calculate strength
@@ -81,10 +96,7 @@ def get_observations(data, mod, thr_t, thr_p, alternative, ci):
             edges = pd.DataFrame((df_pvals < 2 * thr_p).values & (df_tvals > 0).values, columns=df_pvals.columns,
                                  index=df_pvals.index)
             strength = (df_tvals.abs() - qt) * (1 - 2 * (df_tvals < 0))
-    et = time.time()
-    print('Edges and strength calculation finished in %.5f [s]' % (et-st))
 
-    st = time.time()
     observations = {}
     for var in edges.index:
         e = np.where(edges.loc[var] == 1)
@@ -93,8 +105,6 @@ def get_observations(data, mod, thr_t, thr_p, alternative, ci):
         s = strength.loc[var].values[e]
         observations[var] = pd.DataFrame(np.vstack((e, ci_row, ci_col, s)).T,
                                          columns=["2Dcol", "3Drow", "3Dcol", "strn"])
-    et = time.time()
-    print('Saving clusters for each variable finished in %.5f [s]' % (et-st))
 
     return observations
 
@@ -112,13 +122,12 @@ class NBR(object):
             self,
             fname,
             n_nodes,
+            predictor_cols,
             mod,
             alternative,
-            n_perm,
             diag=False,
             thr_p=0.05,
             thr_t=None,
-            cores=None,
             nudist=False,
             exp_list=None,
             verbose=True,
@@ -138,9 +147,9 @@ class NBR(object):
             print('[error] File Not Found!')
 
         self.n_nodes = n_nodes
+        self.predictor_cols = predictor_cols
         self.mod = mod
         self.alternative = alternative
-        self.n_perm = n_perm
         self.diag = diag
         self.thr_p = thr_p
         self.thr_t = thr_t
@@ -148,14 +157,9 @@ class NBR(object):
         self.expList = exp_list
         self.verbose = verbose
 
-        if cores is None:
-            self.cores = 1
-        elif cores == -1:
-            self.cores = mp.cpu_count()
-        else:
-            self.cores = cores
-
         self._args_check()
+        self._create_connection_indices()
+        self._data_preprocessing()
 
     def _args_check(self):
         """
@@ -170,15 +174,8 @@ class NBR(object):
         if not isinstance(self.n_nodes, int) and self.n_nodes > 0:
             raise ValueError("[error] n_nodes parameter must be positive non-zero integer; got (n_nodes=%r)" % self.n_nodes)
 
-        if not isinstance(self.n_perm, int) and self.n_perm > 0:
-            raise ValueError("[error] n_perm parameter must be positive non-zero integer; got (n_perm=%r)" % self.n_perm)
-
         if self.alternative not in ["two.sided", "less", "greater"]:
             raise ValueError("[error] alternative parameter is not correctly specified (options: two.sided, less, greater); got (alternative=%r) " % self.alternative)
-
-        # FIXME: no need to check this if we are already processing it through reading file
-        # if len(self.net) != len(self.idata):
-        #     raise ValueError("Input data dimensions missmatch;")
 
         if (self.thr_p is None and self.thr_t is None) or (self.thr_t is not None and self.thr_p is not None):
             raise ValueError('Thresholds for P and T are incorrectly set; got(pval=%r, tval=%r)' % (self.thr_p, self.thr_t))
@@ -192,23 +189,63 @@ class NBR(object):
         cn[:, [0, 1]] = cn[:, [1, 0]]
         self.connection_indices = cn
 
-    def _fit_linear_model(self):
+    def _data_preprocessing(self):
+        """
 
-        # 1. create connection indicies
-        self._create_connection_indices()
+        :return:
+        """
+        # Step 2a: Separate data into exog and edog
+        y = self.data[[col for col in self.data.columns if col not in self.predictor_cols]]
+        X = self.data[self.predictor_cols]
 
-        get_observations(self.data, self.mod, self.thr_t, self.thr_p, self.alternative, self.connection_indices)
+        # Step 2b: create dummy values for categorical data in
+        column_types = X.dtypes
+        object_columns = column_types[column_types == 'object'].index
+        dummy_columns = pd.get_dummies(X[object_columns], drop_first=True)
+        X = pd.concat([dummy_columns, X], axis=1).drop(columns=object_columns)
+        # FIXME: we should read this from input, but atm we will keep it here as hardcoded
+        X['Sex_m_Age'] = X['Sex_M'] * X['Age']
 
-    def _permutations(self, n_core, n_perm):
-        st = time.time()
-        self._create_connection_indices()
+        self.X = X
+        self.y = y
+
+    def _linear_mixture_models(self):
+        """
+
+        :return:
+        """
+        self.init_observations = get_observations(
+            self.X,
+            self.y,
+            self.thr_t,
+            self.thr_p,
+            self.alternative,
+            self.connection_indices
+        )
+
+    def _linear_mixture_models_with_permutations(self, n_core=None, n_perm=1):
+
+        if n_core is None:
+            n_core = 1
+        elif n_core == -1:
+            n_core = mp.cpu_count()
+        else:
+            if not isinstance(n_core, int) and n_core > 0:
+                raise ValueError("[error] n_core parameter must be positive non-zero integer; got (n_core=%r)" % n_core)
+
+        if not isinstance(n_perm, int) and n_perm > 0:
+            raise ValueError("[error] n_perm parameter must be positive non-zero integer; got (n_perm=%r)" % n_perm)
+
         pool = mp.Pool(n_core, init_worker)
         results_p = []
         try:
             for _ in range(n_perm):
-                df_ = pd.concat([self.data[['Group', 'Sex', 'Age']].sample(self.data.shape[0]).reset_index(drop=True),
-                                 self.data.drop(columns=['Group', 'Sex', 'Age'])], axis=1)
-                results_p.append(pool.apply_async(get_observations, args=(self.data, self.mod, None, 0.05, "less", self.connection_indices)))
+                # apply permutation
+                X_ = self.X.sample(self.X.shape[0]).copy()
+                results_p.append(pool.apply_async(
+                    func=get_observations,
+                    args=(X_, self.y, self.thr_t, self.thr_p, self.alternative, self.connection_indices)
+                ))
         except KeyboardInterrupt:
             print('[Exception: Keyboard] Terminate MultiProcessing')
             pool.terminate()
@@ -222,6 +259,3 @@ class NBR(object):
             pool.close()
             pool.join()
             results_p = [r.get() for r in results_p]
-
-        et = time.time()
-        print('[perfr-measurment] %d permutations with ncore=%d finished in %.2f [sec]' % (n_perm, n_core, et - st))
